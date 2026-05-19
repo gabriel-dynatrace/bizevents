@@ -409,57 +409,87 @@ The Business Events app gives you a no-DQL view of the same data — useful for 
 
 ## Worked Example — EasyTrade `broker-service`
 
-To make the abstract concrete, here is a complete worked example for the Dynatrace **EasyTrade** demo app.
+This example was deployed end-to-end on a live Dynatrace sprint tenant. Every field, query, and output below comes from that deployment.
 
-> Reference: a Dynatrace-internal companion guide (`bizevents-easytrade.md`) configures 8 EasyTrade business events via the *HTTP-incoming capture rule* mechanism (`builtin:bizevents.http.incoming`). This guide derives one similar event from spans via OpenPipeline instead — useful when you don't have OneAgent on the request path but do have OTel spans flowing.
+> Reference: a Dynatrace-internal companion guide (`bizevents-easytrade.md`) configures 8 EasyTrade business events via the *HTTP-incoming capture rule* mechanism (`builtin:bizevents.http.incoming`). This guide derives a separate generic event from spans via OpenPipeline instead — useful when you don't have OneAgent on the request path but do have OTel spans flowing, or when you want a coarse-grained signal in addition to the per-route HTTP rules.
 
-### Span source (validated)
+### Span source
 
 EasyTrade's broker-service emits server spans like:
 
 | span.name | http.route | duration (ns) |
 |---|---|---|
-| `GET v1/trade/{accountId:int}` | `v1/trade/{accountId:int}` | 8,678,000 |
-| `POST v1/trade/sell` | `v1/trade/sell` | 27,917,000 |
-| `POST v1/trade/long/sell` | `v1/trade/long/sell` | 19,328,000 |
-| `GET v1/balance/{accountId:int}` | `v1/balance/{accountId:int}` | 1,685,000 |
+| `GET v1/trade/{accountId:int}` | `v1/trade/{accountId:int}` | 5,331,000 |
+| `GET api/Packages/GetPackages` | `api/Packages/GetPackages` | 3,782,000 |
+| `GET api/Products/GetProducts` | `api/Products/GetProducts` | 4,381,000 |
+| `GET /*` | `/*` | 245,000 |
 
-### Pipeline config
+### Reuse the existing pipeline, don't duplicate
 
-| Field | Value |
+If your target namespace already has a spans pipeline (this tenant already has **`EasyTrade Spans`** with metric extraction from the [spans-to-metrics guide](https://github.com/gabriel-dynatrace/dynatrace-cse)), **add the bizevent processor as a new Data extraction stage in that existing pipeline** rather than creating a separate pipeline. Routing is 1-to-1 — a second pipeline matching the same namespace would either never receive spans (existing route wins) or require splitting the route, breaking your existing metric extraction.
+
+| Field | Value (as deployed) |
 |---|---|
-| **Pipeline name** | `EasyTrade Broker Bizevents` |
-| **Custom ID** | `easytrade-broker-bizevents` |
+| **Pipeline used** | `EasyTrade Spans` (existing — preserved metric extraction processors) |
+| **Custom ID** | `easytrade-spans` |
+| **Stage added** | `dataExtraction` |
 
-### Bizevent processor config
+### Bizevent processor config (as deployed)
 
 | Field | Value |
 |---|---|
 | **Name** | `Broker request → bizevent` |
-| **Custom ID** | `broker-request-bizevent` |
+| **Custom ID** | `easytrade-broker-bizevent` |
 | **Matcher** | `` `k8s.namespace.name` == "easytrade" and span.kind == "server" `` |
 | **Event type** (assignment) | Constant → `com.easytrade.broker.request` |
 | **Event provider** (assignment) | Constant → `com.easytrade.broker` |
-| **Field extraction** | Include fields: `span.name`, `http.route`, `http.request.method`, `http.response.status_code`, `duration`, `dt.entity.service`, `k8s.namespace.name` |
+| **Field extraction** | Include 7 fields: `span.name`, `http.route`, `http.request.method`, `http.response.status_code`, `duration`, `dt.entity.service`, `k8s.namespace.name` |
 
-### Routing rule config
+### Routing rule (already in place — no changes needed)
 
 | Field | Value |
 |---|---|
 | **Name** | `EasyTrade namespace spans` |
 | **Matching condition** | `` `k8s.namespace.name` == "easytrade" `` |
-| **Pipeline** | `EasyTrade Broker Bizevents` |
+| **Pipeline** | `EasyTrade Spans` |
 
-### Validation
+### Live validation output
+
+The processor was applied via `dtctl apply -f easytrade-spans-with-bizevent.json` and produced bizevents within ~1 minute. Sample query and real output:
 
 ```dql
-fetch bizevents, from: now()-1h
+fetch bizevents, from: now()-5m
 | filter event.provider == "com.easytrade.broker"
-| summarize total = count(), by: {event.type, span.name}
-| sort total desc
+| summarize requests = count(), by: {span.name}
+| sort requests desc
 ```
 
-Expected output — one row per `(event.type, span.name)` combination, with counts matching the EasyTrade broker-service traffic over the last hour.
+| span.name | requests (5 min window) |
+|---|---|
+| `GET /*` | 3 |
+| `FlagController/getFlagById` | 2 |
+| `GET /api/offers/:platform` | 2 |
+| `GET api/Packages/GetPackages` | 2 |
+| `GET api/Products/GetProducts` | 2 |
+| `FlagController/getFlags` | 1 |
+| `GET v1/trade/{accountId:int}` | 1 |
+
+A sample individual event (full field map):
+
+| Field | Value |
+|---|---|
+| `timestamp` | `2026-05-19T01:28:27.600368000Z` |
+| `event.type` | `com.easytrade.broker.request` |
+| `event.provider` | `com.easytrade.broker` |
+| `span.name` | `GET v1/trade/{accountId:int}` |
+| `http.route` | `v1/trade/{accountId:int}` |
+| `http.request.method` | `GET` |
+| `http.response.status_code` | `200` |
+| `duration` | `5331000` |
+| `dt.entity.service` | `SERVICE-8FF5AE7ADD6FA40A` |
+| `k8s.namespace.name` | `easytrade` |
+
+All 7 configured extraction fields populated correctly from the source span. The bizevent's `timestamp` matches the span's start time (not the OpenPipeline ingest time), confirming the [Tip on timestamp behavior](#bizevents-inherit-the-spans-timestamp--you-cannot-override).
 
 ---
 
